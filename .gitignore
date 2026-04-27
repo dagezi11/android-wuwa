@@ -39,3 +39,5 @@ android-wuwa.mod.c
 android-wuwa.lds
 android-wuwa.ko
 
+build-logs/
+out/
