@@ -4,6 +4,8 @@
 #include "wuwa_common.h"
 #include "wuwa_bindproc.h"
 
+#include <linux/uio.h>
+
 struct wuwa_addr_translate_cmd {
     uintptr_t phy_addr; /* Output: Physical address after translation */
     pid_t pid; /* Input: Process ID owning the virtual address */
@@ -172,6 +174,22 @@ struct wuwa_get_proc_info_cmd {
     int prio; /* Output: Process priority */
 };
 
+enum wuwa_memory_iov_mode {
+    WUWA_MEMORY_IOV_PHYS_DIRECT = 0,
+    WUWA_MEMORY_IOV_IOREMAP = 1,
+};
+
+struct wuwa_memory_iov_cmd {
+    pid_t pid; /* Input: target process ID */
+    struct iovec __user* local_iov; /* Input: current process buffers */
+    unsigned long local_iovcnt; /* Input: number of local iovecs */
+    struct iovec __user* remote_iov; /* Input: target process virtual ranges */
+    unsigned long remote_iovcnt; /* Input: number of remote iovecs */
+    size_t bytes_done; /* Output: transferred bytes */
+    int mode; /* Input: enum wuwa_memory_iov_mode */
+    int prot; /* Input: memory type for ioremap mode */
+};
+
 /* IOCTL command for virtual to physical address translation */
 #define WUWA_IOCTL_ADDR_TRANSLATE _IOWR('W', 1, struct wuwa_addr_translate_cmd)
 /* IOCTL command for debugging information */
@@ -214,6 +232,10 @@ struct wuwa_get_proc_info_cmd {
 #define WUWA_IOCTL_LIST_PROCESSES _IOWR('W', 19, struct wuwa_list_processes_cmd)
 /* IOCTL command for getting process information by PID */
 #define WUWA_IOCTL_GET_PROC_INFO _IOWR('W', 20, struct wuwa_get_proc_info_cmd)
+/* IOCTL command for vectored memory read */
+#define WUWA_IOCTL_READV_MEMORY _IOWR('W', 21, struct wuwa_memory_iov_cmd)
+/* IOCTL command for vectored memory write */
+#define WUWA_IOCTL_WRITEV_MEMORY _IOWR('W', 22, struct wuwa_memory_iov_cmd)
 
 int do_vaddr_translate(struct socket* sock, void __user* arg);
 int do_debug_info(struct socket* sock, void __user* arg);
@@ -236,6 +258,8 @@ int do_read_physical_memory_ioremap(struct socket* sock, void __user* arg);
 int do_write_physical_memory_ioremap(struct socket* sock, void __user* arg);
 int do_list_processes(struct socket* sock, void __user* arg);
 int do_get_process_info(struct socket* sock, void __user* arg);
+int do_readv_memory(struct socket* sock, void __user* arg);
+int do_writev_memory(struct socket* sock, void __user* arg);
 
 typedef int (*ioctl_handler_t)(struct socket* sock, void __user* arg);
 
@@ -265,6 +289,8 @@ static const struct ioctl_cmd_map {
     {.cmd = WUWA_IOCTL_BIND_PROC, .handler = do_bind_proc},
     {.cmd = WUWA_IOCTL_LIST_PROCESSES, .handler = do_list_processes},
     {.cmd = WUWA_IOCTL_GET_PROC_INFO, .handler = do_get_process_info},
+    {.cmd = WUWA_IOCTL_READV_MEMORY, .handler = do_readv_memory},
+    {.cmd = WUWA_IOCTL_WRITEV_MEMORY, .handler = do_writev_memory},
     {.cmd = 0, .handler = NULL} /* Sentinel to mark end of array */
 };
 

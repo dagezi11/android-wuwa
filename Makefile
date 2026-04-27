@@ -6,6 +6,7 @@ android-wuwa-y := \
     src/net/wuwa_protocol.o \
     src/utils/wuwa_utils.o \
     src/ioctl/wuwa_ioctl.o \
+    src/ioctl/wuwa_memory_iov.o \
     src/mm/wuwa_page_walk.o \
     src/mm/wuwa_proc_dmabuf.o \
     src/hook/wuwa_safe_signal.o \

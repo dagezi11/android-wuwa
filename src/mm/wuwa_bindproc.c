@@ -73,9 +73,149 @@ struct bp_write_memory_cmd {
     size_t size; /* Input: Size of memory to write */
 };
 
+struct bp_memory_iov_cmd {
+    struct iovec __user* local_iov;
+    unsigned long local_iovcnt;
+    struct iovec __user* remote_iov;
+    unsigned long remote_iovcnt;
+    size_t bytes_done;
+};
+
 #define WUWA_BP_IOCTL_SET_MEMORY_PROT _IOWR('B', 1, int) /* arg: int (WMT_*) */
 #define WUWA_BP_IOCTL_READ_MEMORY _IOWR('B', 2, struct bp_read_memory_cmd)
 #define WUWA_BP_IOCTL_WRITE_MEMORY _IOWR('B', 3, struct bp_write_memory_cmd)
+#define WUWA_BP_IOCTL_READV_MEMORY _IOWR('B', 4, struct bp_memory_iov_cmd)
+#define WUWA_BP_IOCTL_WRITEV_MEMORY _IOWR('B', 5, struct bp_memory_iov_cmd)
+
+#define WUWA_BP_IOV_MAX 1024UL
+#define WUWA_BP_MAX_RW_SIZE (PAGE_SIZE * 16)
+
+static int bindproc_transfer_memory(struct wuwa_bindproc_private* private_data, uintptr_t local_va,
+                                    uintptr_t remote_va, size_t size, bool write) {
+    uintptr_t offset, page_start;
+    size_t bytes_to_copy, copied = 0;
+    int ret = 0;
+
+    if (size == 0 || size > WUWA_BP_MAX_RW_SIZE || !local_va || !remote_va) {
+        return -EINVAL;
+    }
+
+    while (copied < size) {
+        uintptr_t pa;
+        void* mapped;
+
+        ret = translate_process_vaddr(private_data->pid, remote_va + copied, &pa);
+        if (ret < 0) {
+            wuwa_err("failed to translate VA 0x%lx: %d\n", remote_va + copied, ret);
+            return ret;
+        }
+
+        offset = pa & ~PAGE_MASK;
+        page_start = pa & PAGE_MASK;
+        bytes_to_copy = min_t(size_t, size - copied, PAGE_SIZE - offset);
+
+        mapped = find_cached_mapping(private_data, page_start);
+        if (!mapped) {
+            mapped = wuwa_ioremap_prot(page_start, PAGE_SIZE, private_data->prot);
+            if (!mapped) {
+                wuwa_err("failed to ioremap physical address 0x%lx\n", page_start);
+                return -ENOMEM;
+            }
+
+            ret = add_cached_mapping(private_data, page_start, mapped);
+            if (ret < 0) {
+                wuwa_err("failed to cache mapping for PA 0x%lx\n", page_start);
+                iounmap(mapped);
+                return ret;
+            }
+        }
+
+        if (write) {
+            ret = copy_from_user(mapped + offset, (void __user*)(local_va + copied), bytes_to_copy);
+        } else {
+            ret = copy_to_user((void __user*)(local_va + copied), mapped + offset, bytes_to_copy);
+        }
+
+        if (ret != 0) {
+            return -EFAULT;
+        }
+
+        copied += bytes_to_copy;
+    }
+
+    return copied;
+}
+
+static int bindproc_copy_iovec(struct iovec __user* iovecs, unsigned long index, struct iovec* iov) {
+    if (copy_from_user(iov, &iovecs[index], sizeof(*iov))) {
+        return -EFAULT;
+    }
+
+    if (iov->iov_len > 0 && !iov->iov_base) {
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
+static int bindproc_transfer_iov(struct wuwa_bindproc_private* private_data, struct bp_memory_iov_cmd* cmd,
+                                 bool write) {
+    unsigned long local_index = 0, remote_index = 0;
+    size_t local_offset = 0, remote_offset = 0;
+
+    if (!cmd->local_iov || !cmd->remote_iov || cmd->local_iovcnt == 0 || cmd->remote_iovcnt == 0) {
+        return -EINVAL;
+    }
+
+    if (cmd->local_iovcnt > WUWA_BP_IOV_MAX || cmd->remote_iovcnt > WUWA_BP_IOV_MAX) {
+        return -EINVAL;
+    }
+
+    while (local_index < cmd->local_iovcnt && remote_index < cmd->remote_iovcnt) {
+        struct iovec local_iov, remote_iov;
+        uintptr_t local_base, remote_base;
+        size_t chunk;
+        int ret;
+
+        ret = bindproc_copy_iovec(cmd->local_iov, local_index, &local_iov);
+        if (ret < 0) {
+            return cmd->bytes_done ? 0 : ret;
+        }
+
+        ret = bindproc_copy_iovec(cmd->remote_iov, remote_index, &remote_iov);
+        if (ret < 0) {
+            return cmd->bytes_done ? 0 : ret;
+        }
+
+        if (local_offset >= local_iov.iov_len) {
+            local_index++;
+            local_offset = 0;
+            continue;
+        }
+
+        if (remote_offset >= remote_iov.iov_len) {
+            remote_index++;
+            remote_offset = 0;
+            continue;
+        }
+
+        local_base = (uintptr_t)local_iov.iov_base + local_offset;
+        remote_base = (uintptr_t)remote_iov.iov_base + remote_offset;
+        chunk = min_t(size_t, local_iov.iov_len - local_offset, remote_iov.iov_len - remote_offset);
+        chunk = min_t(size_t, chunk, WUWA_BP_MAX_RW_SIZE);
+
+        ret = bindproc_transfer_memory(private_data, local_base, remote_base, chunk, write);
+        if (ret < 0) {
+            return cmd->bytes_done ? 0 : ret;
+        }
+
+        cmd->bytes_done += chunk;
+        local_offset += chunk;
+        remote_offset += chunk;
+    }
+
+    return 0;
+}
 
 static long bindproc_ioctl(struct file* f, unsigned int cmd, unsigned long arg) {
     struct wuwa_bindproc_private* private_data = f->private_data;
@@ -94,7 +234,7 @@ static long bindproc_ioctl(struct file* f, unsigned int cmd, unsigned long arg) 
                 return -EFAULT;
             }
 
-            if (prot < WMT_NORMAL || prot > WMT_DEVICE_nGnRnE) {
+            if (prot < WMT_NORMAL || prot > WMT_NORMAL_iNC_oWB) {
                 return -EINVAL;
             }
 
@@ -122,6 +262,7 @@ static long bindproc_ioctl(struct file* f, unsigned int cmd, unsigned long arg) 
                 mutex_unlock(&private_data->lock);
             }
 
+            private_data->prot = new_prot;
             wuwa_info("set memory prot to %d for pid %d\n", prot, private_data->pid);
             return ret;
         }
@@ -131,80 +272,7 @@ static long bindproc_ioctl(struct file* f, unsigned int cmd, unsigned long arg) 
             if (copy_from_user(&cmd, (struct bp_read_memory_cmd __user*)arg, sizeof(cmd))) {
                 return -EFAULT;
             }
-            if (cmd.size == 0 || cmd.size > 0x10000) {
-                return -EINVAL;
-            }
-            if (!cmd.src_va || !cmd.dst_va) {
-                return -EINVAL;
-            }
-
-            uintptr_t va, pa;
-            uintptr_t offset, page_start;
-            void* mapped;
-            size_t bytes_to_read, total_read = 0;
-
-            // Validate size: allow reads up to reasonable limit
-            if (cmd.size == 0 || cmd.size > (PAGE_SIZE * 16)) {
-                wuwa_err("invalid read size: %zu\n", cmd.size);
-                return -EINVAL;
-            }
-
-            va = cmd.src_va;
-            //wuwa_info("bindproc_read: pid=%d, va=0x%lx, size=%zu\n", private_data->pid, va, cmd.size);
-
-            while (total_read < cmd.size) {
-                /* Translate current virtual address to physical */
-                ret = translate_process_vaddr(private_data->pid, va + total_read, &pa);
-                if (ret < 0) {
-                    wuwa_err("failed to translate VA 0x%lx: %d\n", va + total_read, ret);
-                    goto out;
-                }
-
-                /* Calculate page-aligned address and offset */
-                offset = pa & ~PAGE_MASK;
-                page_start = pa & PAGE_MASK;
-
-                /* Determine how many bytes we can read from this page */
-                bytes_to_read = min_t(size_t, cmd.size - total_read, PAGE_SIZE - offset);
-
-                //wuwa_info("Reading %zu bytes from VA 0x%lx (PA 0x%lx)\n", bytes_to_read, va + total_read, pa);
-                //wuwa_info("  Page start: 0x%lx, Offset: 0x%lx\n", page_start, offset);
-
-                /* Check cache for existing mapping */
-                mapped = find_cached_mapping(private_data, page_start);
-                if (!mapped) {
-                    /* Not cached, create new mapping */
-                    mapped = wuwa_ioremap_prot(page_start, PAGE_SIZE, private_data->prot);
-                    if (!mapped) {
-                        wuwa_err("failed to ioremap physical address 0x%lx\n", page_start);
-                        ret = -ENOMEM;
-                        goto out;
-                    }
-
-                    /* Add to cache */
-                    ret = add_cached_mapping(private_data, page_start, mapped);
-                    if (ret < 0) {
-                        wuwa_err("failed to cache mapping for PA 0x%lx\n", page_start);
-                        iounmap(mapped);
-                        goto out;
-                    }
-                }
-
-                /* Copy data to userspace */
-                ret = copy_to_user(cmd.dst_va + total_read, mapped + offset, bytes_to_read);
-                if (ret != 0) {
-                    wuwa_err("copy_to_user failed: %d bytes not copied\n", ret);
-                    ret = -EFAULT;
-                    goto out;
-                }
-
-                total_read += bytes_to_read;
-            }
-
-            ret = total_read;
-
-        out:
-            return ret;
+            return bindproc_transfer_memory(private_data, cmd.dst_va, cmd.src_va, cmd.size, false);
         }
     case WUWA_BP_IOCTL_WRITE_MEMORY:
         {
@@ -212,75 +280,22 @@ static long bindproc_ioctl(struct file* f, unsigned int cmd, unsigned long arg) 
             if (copy_from_user(&cmd, (struct bp_write_memory_cmd __user*)arg, sizeof(cmd))) {
                 return -EFAULT;
             }
-            if (cmd.size == 0 || cmd.size > 0x10000) {
-                return -EINVAL;
-            }
-            if (!cmd.src_va || !cmd.dst_va) {
-                return -EINVAL;
-            }
-
-            uintptr_t va, pa;
-            uintptr_t offset, page_start;
-            void* mapped;
-            size_t bytes_to_write, total_written = 0;
-
-            // Validate size: allow writes up to reasonable limit
-            if (cmd.size == 0 || cmd.size > (PAGE_SIZE * 16)) {
-                wuwa_err("invalid write size: %zu\n", cmd.size);
-                return -EINVAL;
+            return bindproc_transfer_memory(private_data, cmd.src_va, cmd.dst_va, cmd.size, true);
+        }
+    case WUWA_BP_IOCTL_READV_MEMORY:
+    case WUWA_BP_IOCTL_WRITEV_MEMORY:
+        {
+            struct bp_memory_iov_cmd iov_cmd;
+            if (copy_from_user(&iov_cmd, (struct bp_memory_iov_cmd __user*)arg, sizeof(iov_cmd))) {
+                return -EFAULT;
             }
 
-            va = cmd.dst_va;
-
-            while (total_written < cmd.size) {
-                /* Translate current virtual address to physical */
-                ret = translate_process_vaddr(private_data->pid, va + total_written, &pa);
-                if (ret < 0) {
-                    wuwa_err("failed to translate VA 0x%lx: %d\n", va + total_written, ret);
-                    goto out_write;
-                }
-
-                /* Calculate page-aligned address and offset */
-                offset = pa & ~PAGE_MASK;
-                page_start = pa & PAGE_MASK;
-
-                /* Determine how many bytes we can write to this page */
-                bytes_to_write = min_t(size_t, cmd.size - total_written, PAGE_SIZE - offset);
-
-                /* Check cache for existing mapping */
-                mapped = find_cached_mapping(private_data, page_start);
-                if (!mapped) {
-                    /* Not cached, create new mapping */
-                    mapped = wuwa_ioremap_prot(page_start, PAGE_SIZE, private_data->prot);
-                    if (!mapped) {
-                        wuwa_err("failed to ioremap physical address 0x%lx\n", page_start);
-                        ret = -ENOMEM;
-                        goto out_write;
-                    }
-
-                    /* Add to cache */
-                    ret = add_cached_mapping(private_data, page_start, mapped);
-                    if (ret < 0) {
-                        wuwa_err("failed to cache mapping for PA 0x%lx\n", page_start);
-                        iounmap(mapped);
-                        goto out_write;
-                    }
-                }
-
-                /* Copy data from userspace to target process memory */
-                ret = copy_from_user(mapped + offset, (void __user*)(cmd.src_va + total_written), bytes_to_write);
-                if (ret != 0) {
-                    wuwa_err("copy_from_user failed: %d bytes not copied\n", ret);
-                    ret = -EFAULT;
-                    goto out_write;
-                }
-
-                total_written += bytes_to_write;
+            iov_cmd.bytes_done = 0;
+            ret = bindproc_transfer_iov(private_data, &iov_cmd, cmd == WUWA_BP_IOCTL_WRITEV_MEMORY);
+            if (copy_to_user((void __user*)arg, &iov_cmd, sizeof(iov_cmd))) {
+                return -EFAULT;
             }
 
-            ret = total_written;
-
-        out_write:
             return ret;
         }
     default:

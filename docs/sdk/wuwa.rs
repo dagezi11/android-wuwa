@@ -32,7 +32,7 @@ use std::ptr::NonNull;
 use log::{debug, error, info, log_enabled, Level};
 use nix::errno::Errno;
 use nix::{libc, NixPath};
-use nix::libc::{c_int, free, getsockopt, ioctl, malloc, mmap, size_t, sockaddr_in, socklen_t, pid_t, _IOWR, _IOR, Ioctl};
+use nix::libc::{c_int, close, free, getsockopt, ioctl, iovec, malloc, mmap, size_t, sockaddr_in, socklen_t, pid_t, _IOWR, _IOR, Ioctl};
 use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
 
 // IOCTL command definitions (magic number 'W')
@@ -54,6 +54,10 @@ const WUWA_IOCTL_GIVE_ROOT: Ioctl = _IOWR::<WuwaGiveRootCmd>(b'W' as u32, 15);
 const WUWA_IOCTL_READ_MEMORY_IOREMAP: Ioctl = _IOWR::<WuwaReadPhysicalMemoryIoremapCmd>(b'W' as u32, 16);
 const WUWA_IOCTL_WRITE_MEMORY_IOREMAP: Ioctl = _IOWR::<WuwaWritePhysicalMemoryIoremapCmd>(b'W' as u32, 17);
 const WUWA_IOCTL_BIND_PROC: Ioctl = _IOWR::<WuwaBindProcCmd>(b'W' as u32, 18);
+const WUWA_IOCTL_READV_MEMORY: Ioctl = _IOWR::<WuwaMemoryIovCmd>(b'W' as u32, 21);
+const WUWA_IOCTL_WRITEV_MEMORY: Ioctl = _IOWR::<WuwaMemoryIovCmd>(b'W' as u32, 22);
+const WUWA_BP_IOCTL_READV_MEMORY: Ioctl = _IOWR::<BpMemoryIovCmd>(b'B' as u32, 4);
+const WUWA_BP_IOCTL_WRITEV_MEMORY: Ioctl = _IOWR::<BpMemoryIovCmd>(b'B' as u32, 5);
 
 // Command structures matching kernel definitions
 
@@ -208,6 +212,86 @@ pub struct WuwaWritePhysicalMemoryIoremapCmd {
 pub struct WuwaBindProcCmd {
     pub pid: pid_t,
     pub fd: c_int,
+}
+
+#[repr(C)]
+pub struct WuwaMemoryIovCmd {
+    pub pid: pid_t,
+    pub local_iov: *mut iovec,
+    pub local_iovcnt: usize,
+    pub remote_iov: *mut iovec,
+    pub remote_iovcnt: usize,
+    pub bytes_done: size_t,
+    pub mode: c_int,
+    pub prot: c_int,
+}
+
+#[repr(C)]
+pub struct BpMemoryIovCmd {
+    pub local_iov: *mut iovec,
+    pub local_iovcnt: usize,
+    pub remote_iov: *mut iovec,
+    pub remote_iovcnt: usize,
+    pub bytes_done: size_t,
+}
+
+#[repr(i32)]
+pub enum WuwaMemoryIovMode {
+    PhysDirect = 0,
+    Ioremap = 1,
+}
+
+/// Bound process handle using cached ioremap pages.
+pub struct BindProc {
+    fd: c_int,
+}
+
+impl Drop for BindProc {
+    fn drop(&mut self) {
+        unsafe {
+            close(self.fd);
+        }
+    }
+}
+
+impl BindProc {
+    pub fn readv(&self, local_iov: &mut [iovec], remote_iov: &[iovec]) -> Result<usize, anyhow::Error> {
+        let mut cmd = BpMemoryIovCmd {
+            local_iov: local_iov.as_mut_ptr(),
+            local_iovcnt: local_iov.len(),
+            remote_iov: remote_iov.as_ptr() as *mut iovec,
+            remote_iovcnt: remote_iov.len(),
+            bytes_done: 0,
+        };
+
+        unsafe {
+            let result = ioctl(self.fd, WUWA_BP_IOCTL_READV_MEMORY, &mut cmd as *mut _ as *mut c_void);
+            if result < 0 {
+                return Err(anyhow!("bind_process readv failed"));
+            }
+        }
+
+        Ok(cmd.bytes_done)
+    }
+
+    pub fn writev(&self, local_iov: &[iovec], remote_iov: &[iovec]) -> Result<usize, anyhow::Error> {
+        let mut cmd = BpMemoryIovCmd {
+            local_iov: local_iov.as_ptr() as *mut iovec,
+            local_iovcnt: local_iov.len(),
+            remote_iov: remote_iov.as_ptr() as *mut iovec,
+            remote_iovcnt: remote_iov.len(),
+            bytes_done: 0,
+        };
+
+        unsafe {
+            let result = ioctl(self.fd, WUWA_BP_IOCTL_WRITEV_MEMORY, &mut cmd as *mut _ as *mut c_void);
+            if result < 0 {
+                return Err(anyhow!("bind_process writev failed"));
+            }
+        }
+
+        Ok(cmd.bytes_done)
+    }
 }
 
 /// WuWa driver connection handle
@@ -458,6 +542,54 @@ impl WuWaDriver {
         Ok(cmd.phy_addr)
     }
 
+    /// Vectored memory read using direct physical access or ioremap mode.
+    pub fn readv_memory(&self, pid: pid_t, local_iov: &mut [iovec], remote_iov: &[iovec],
+                        mode: WuwaMemoryIovMode, prot: c_int) -> Result<usize, anyhow::Error> {
+        let mut cmd = WuwaMemoryIovCmd {
+            pid,
+            local_iov: local_iov.as_mut_ptr(),
+            local_iovcnt: local_iov.len(),
+            remote_iov: remote_iov.as_ptr() as *mut iovec,
+            remote_iovcnt: remote_iov.len(),
+            bytes_done: 0,
+            mode: mode as c_int,
+            prot,
+        };
+
+        unsafe {
+            let result = ioctl(self.sock.as_raw_fd(), WUWA_IOCTL_READV_MEMORY, &mut cmd as *mut _ as *mut c_void);
+            if result < 0 {
+                return Err(anyhow!("vectored memory read failed"));
+            }
+        }
+
+        Ok(cmd.bytes_done)
+    }
+
+    /// Vectored memory write using direct physical access or ioremap mode.
+    pub fn writev_memory(&self, pid: pid_t, local_iov: &[iovec], remote_iov: &[iovec],
+                         mode: WuwaMemoryIovMode, prot: c_int) -> Result<usize, anyhow::Error> {
+        let mut cmd = WuwaMemoryIovCmd {
+            pid,
+            local_iov: local_iov.as_ptr() as *mut iovec,
+            local_iovcnt: local_iov.len(),
+            remote_iov: remote_iov.as_ptr() as *mut iovec,
+            remote_iovcnt: remote_iov.len(),
+            bytes_done: 0,
+            mode: mode as c_int,
+            prot,
+        };
+
+        unsafe {
+            let result = ioctl(self.sock.as_raw_fd(), WUWA_IOCTL_WRITEV_MEMORY, &mut cmd as *mut _ as *mut c_void);
+            if result < 0 {
+                return Err(anyhow!("vectored memory write failed"));
+            }
+        }
+
+        Ok(cmd.bytes_done)
+    }
+
     /// Type-safe read of arbitrary struct from target process
     pub fn read<T: Sized>(&self, pid: pid_t, src_va: usize) -> Result<T, anyhow::Error> {
         let mut buffer: MaybeUninit<T> = MaybeUninit::uninit();
@@ -702,6 +834,13 @@ impl WuWaDriver {
         }
 
         Ok(cmd.fd)
+    }
+
+    /// Bind process, returns a managed handle with cached readv/writev.
+    pub fn bind_process_handle(&self, pid: pid_t) -> Result<BindProc, anyhow::Error> {
+        Ok(BindProc {
+            fd: self.bind_process(pid)?,
+        })
     }
 
     /// Copy process with custom function pointer and stack

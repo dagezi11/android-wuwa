@@ -29,6 +29,7 @@
 
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/uio.h>
 #include <linux/if_alg.h>
 #include <unistd.h>
 #include <cstdint>
@@ -61,6 +62,7 @@ struct WuwaWritePhysicalMemoryIoremapCmd;
 struct WuwaBindProcCmd;
 struct WuwaListProcessesCmd;
 struct WuwaGetProcInfoCmd;
+struct WuwaMemoryIovCmd;
 
 // IOCTL command definitions (magic number 'W')
 // Must use actual struct types for correct command number calculation
@@ -84,6 +86,8 @@ struct WuwaGetProcInfoCmd;
 #define WUWA_IOCTL_BIND_PROC _IOWR('W', 18, WuwaBindProcCmd)
 #define WUWA_IOCTL_LIST_PROCESSES _IOWR('W', 19, WuwaListProcessesCmd)
 #define WUWA_IOCTL_GET_PROC_INFO _IOWR('W', 20, WuwaGetProcInfoCmd)
+#define WUWA_IOCTL_READV_MEMORY _IOWR('W', 21, WuwaMemoryIovCmd)
+#define WUWA_IOCTL_WRITEV_MEMORY _IOWR('W', 22, WuwaMemoryIovCmd)
 
 // Command structures matching kernel definitions
 
@@ -239,6 +243,22 @@ struct WuwaGetProcInfoCmd {
     int prio;
 };
 
+enum WuwaMemoryIovMode {
+    WUWA_MEMORY_IOV_PHYS_DIRECT = 0,
+    WUWA_MEMORY_IOV_IOREMAP = 1
+};
+
+struct WuwaMemoryIovCmd {
+    pid_t pid;
+    struct iovec* local_iov;
+    unsigned long local_iovcnt;
+    struct iovec* remote_iov;
+    unsigned long remote_iovcnt;
+    size_t bytes_done;
+    int mode;
+    int prot;
+};
+
 /**
  * Process information with memory usage statistics
  *
@@ -319,10 +339,20 @@ struct BpWriteMemoryCmd {
     size_t size;
 };
 
+struct BpMemoryIovCmd {
+    struct iovec* local_iov;
+    unsigned long local_iovcnt;
+    struct iovec* remote_iov;
+    unsigned long remote_iovcnt;
+    size_t bytes_done;
+};
+
 // BindProc ioctl commands
 #define WUWA_BP_IOCTL_SET_MEMORY_PROT _IOWR('B', 1, int)
 #define WUWA_BP_IOCTL_READ_MEMORY _IOWR('B', 2, BpReadMemoryCmd)
 #define WUWA_BP_IOCTL_WRITE_MEMORY _IOWR('B', 3, BpWriteMemoryCmd)
+#define WUWA_BP_IOCTL_READV_MEMORY _IOWR('B', 4, BpMemoryIovCmd)
+#define WUWA_BP_IOCTL_WRITEV_MEMORY _IOWR('B', 5, BpMemoryIovCmd)
 
 /**
  * Bound process handle for efficient memory access
@@ -407,6 +437,44 @@ public:
 
         int ret = ioctl(fd_, WUWA_BP_IOCTL_WRITE_MEMORY, &cmd);
         return ret < 0 ? -1 : ret;
+    }
+
+    /**
+     * Read multiple target ranges into multiple local buffers
+     */
+    ssize_t readv(struct iovec* local_iov, unsigned long local_iovcnt,
+                  const struct iovec* remote_iov, unsigned long remote_iovcnt) {
+        if (fd_ < 0) return -1;
+
+        BpMemoryIovCmd cmd = {
+            local_iov,
+            local_iovcnt,
+            const_cast<struct iovec*>(remote_iov),
+            remote_iovcnt,
+            0
+        };
+
+        int ret = ioctl(fd_, WUWA_BP_IOCTL_READV_MEMORY, &cmd);
+        return ret < 0 ? -1 : static_cast<ssize_t>(cmd.bytes_done);
+    }
+
+    /**
+     * Write multiple local buffers into multiple target ranges
+     */
+    ssize_t writev(const struct iovec* local_iov, unsigned long local_iovcnt,
+                   const struct iovec* remote_iov, unsigned long remote_iovcnt) {
+        if (fd_ < 0) return -1;
+
+        BpMemoryIovCmd cmd = {
+            const_cast<struct iovec*>(local_iov),
+            local_iovcnt,
+            const_cast<struct iovec*>(remote_iov),
+            remote_iovcnt,
+            0
+        };
+
+        int ret = ioctl(fd_, WUWA_BP_IOCTL_WRITEV_MEMORY, &cmd);
+        return ret < 0 ? -1 : static_cast<ssize_t>(cmd.bytes_done);
     }
 
     /**
@@ -623,6 +691,54 @@ public:
             return std::nullopt;
         }
         return cmd.phy_addr;
+    }
+
+    /**
+     * Vectored memory read using direct physical access or ioremap mode
+     */
+    ssize_t readv_memory(pid_t pid, struct iovec* local_iov, unsigned long local_iovcnt,
+                         const struct iovec* remote_iov, unsigned long remote_iovcnt,
+                         WuwaMemoryIovMode mode = WUWA_MEMORY_IOV_PHYS_DIRECT,
+                         WuwaMemoryType prot = WMT_NORMAL) {
+        WuwaMemoryIovCmd cmd = {
+            pid,
+            local_iov,
+            local_iovcnt,
+            const_cast<struct iovec*>(remote_iov),
+            remote_iovcnt,
+            0,
+            static_cast<int>(mode),
+            static_cast<int>(prot)
+        };
+
+        if (!do_ioctl(WUWA_IOCTL_READV_MEMORY, &cmd)) {
+            return -1;
+        }
+        return static_cast<ssize_t>(cmd.bytes_done);
+    }
+
+    /**
+     * Vectored memory write using direct physical access or ioremap mode
+     */
+    ssize_t writev_memory(pid_t pid, const struct iovec* local_iov, unsigned long local_iovcnt,
+                          const struct iovec* remote_iov, unsigned long remote_iovcnt,
+                          WuwaMemoryIovMode mode = WUWA_MEMORY_IOV_PHYS_DIRECT,
+                          WuwaMemoryType prot = WMT_NORMAL) {
+        WuwaMemoryIovCmd cmd = {
+            pid,
+            const_cast<struct iovec*>(local_iov),
+            local_iovcnt,
+            const_cast<struct iovec*>(remote_iov),
+            remote_iovcnt,
+            0,
+            static_cast<int>(mode),
+            static_cast<int>(prot)
+        };
+
+        if (!do_ioctl(WUWA_IOCTL_WRITEV_MEMORY, &cmd)) {
+            return -1;
+        }
+        return static_cast<ssize_t>(cmd.bytes_done);
     }
 
     /**
