@@ -41,3 +41,4 @@ android-wuwa.ko
 
 build-logs/
 out/
+docs/sdk/example2-arm64
