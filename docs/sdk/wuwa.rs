@@ -56,6 +56,7 @@ const WUWA_IOCTL_WRITE_MEMORY_IOREMAP: Ioctl = _IOWR::<WuwaWritePhysicalMemoryIo
 const WUWA_IOCTL_BIND_PROC: Ioctl = _IOWR::<WuwaBindProcCmd>(b'W' as u32, 18);
 const WUWA_IOCTL_READV_MEMORY: Ioctl = _IOWR::<WuwaMemoryIovCmd>(b'W' as u32, 21);
 const WUWA_IOCTL_WRITEV_MEMORY: Ioctl = _IOWR::<WuwaMemoryIovCmd>(b'W' as u32, 22);
+const WUWA_IOCTL_GET_PROC_MAPS: Ioctl = _IOWR::<WuwaGetProcMapsCmd>(b'W' as u32, 23);
 const WUWA_BP_IOCTL_READV_MEMORY: Ioctl = _IOWR::<BpMemoryIovCmd>(b'B' as u32, 4);
 const WUWA_BP_IOCTL_WRITEV_MEMORY: Ioctl = _IOWR::<BpMemoryIovCmd>(b'B' as u32, 5);
 
@@ -212,6 +213,17 @@ pub struct WuwaWritePhysicalMemoryIoremapCmd {
 pub struct WuwaBindProcCmd {
     pub pid: pid_t,
     pub fd: c_int,
+}
+
+#[repr(C)]
+pub struct WuwaGetProcMapsCmd {
+    pub pid: pid_t,
+    pub buf: *mut u8,
+    pub buf_size: size_t,
+    pub bytes_written: size_t,
+    pub start_addr: usize,
+    pub next_addr: usize,
+    pub eof: c_int,
 }
 
 #[repr(C)]
@@ -690,6 +702,51 @@ impl WuWaDriver {
         }
 
         Ok(cmd.base)
+    }
+
+    /// Get /proc/<pid>/maps-compatible text without reading procfs.
+    pub fn get_proc_maps(&self, pid: pid_t) -> Result<String, anyhow::Error> {
+        let bytes = self.get_proc_maps_bytes(pid, 256 * 1024)?;
+        String::from_utf8(bytes).map_err(|e| anyhow!("proc maps is not valid UTF-8: {:?}", e))
+    }
+
+    /// Get raw /proc/<pid>/maps-compatible bytes without reading procfs.
+    pub fn get_proc_maps_bytes(&self, pid: pid_t, chunk_size: usize) -> Result<Vec<u8>, anyhow::Error> {
+        let chunk_size = std::cmp::max(chunk_size, 16 * 1024);
+        let mut buffer = vec![0u8; chunk_size];
+        let mut maps = Vec::new();
+        let mut cursor = 0usize;
+
+        loop {
+            let mut cmd = WuwaGetProcMapsCmd {
+                pid,
+                buf: buffer.as_mut_ptr(),
+                buf_size: buffer.len(),
+                bytes_written: 0,
+                start_addr: cursor,
+                next_addr: cursor,
+                eof: 0,
+            };
+
+            unsafe {
+                let result = ioctl(self.sock.as_raw_fd(), WUWA_IOCTL_GET_PROC_MAPS, &mut cmd as *mut _ as *mut c_void);
+                if result < 0 {
+                    return Err(anyhow!("proc maps query failed"));
+                }
+            }
+
+            if cmd.bytes_written > buffer.len() {
+                return Err(anyhow!("proc maps kernel response exceeded buffer"));
+            }
+            maps.extend_from_slice(&buffer[..cmd.bytes_written]);
+            if cmd.eof != 0 {
+                return Ok(maps);
+            }
+            if cmd.next_addr == cursor && cmd.bytes_written == 0 {
+                return Err(anyhow!("proc maps cursor did not advance"));
+            }
+            cursor = cmd.next_addr;
+        }
     }
 
     /// Find process by name, returns PID

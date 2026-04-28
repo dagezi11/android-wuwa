@@ -174,6 +174,16 @@ struct wuwa_get_proc_info_cmd {
     int prio; /* Output: Process priority */
 };
 
+struct wuwa_get_proc_maps_cmd {
+    pid_t pid; /* Input: Process ID to query */
+    char __user* buf; /* Input: User-space output buffer */
+    size_t buf_size; /* Input: Size of output buffer */
+    size_t bytes_written; /* Output: Bytes written in this call */
+    uintptr_t start_addr; /* Input: Address cursor, 0 for the first call */
+    uintptr_t next_addr; /* Output: Cursor for the next call */
+    int eof; /* Output: 1 when all maps content has been returned */
+};
+
 enum wuwa_memory_iov_mode {
     WUWA_MEMORY_IOV_PHYS_DIRECT = 0,
     WUWA_MEMORY_IOV_IOREMAP = 1,
@@ -236,6 +246,8 @@ struct wuwa_memory_iov_cmd {
 #define WUWA_IOCTL_READV_MEMORY _IOWR('W', 21, struct wuwa_memory_iov_cmd)
 /* IOCTL command for vectored memory write */
 #define WUWA_IOCTL_WRITEV_MEMORY _IOWR('W', 22, struct wuwa_memory_iov_cmd)
+/* IOCTL command for returning /proc/<pid>/maps-compatible text */
+#define WUWA_IOCTL_GET_PROC_MAPS _IOWR('W', 23, struct wuwa_get_proc_maps_cmd)
 
 int do_vaddr_translate(struct socket* sock, void __user* arg);
 int do_debug_info(struct socket* sock, void __user* arg);
@@ -260,6 +272,7 @@ int do_list_processes(struct socket* sock, void __user* arg);
 int do_get_process_info(struct socket* sock, void __user* arg);
 int do_readv_memory(struct socket* sock, void __user* arg);
 int do_writev_memory(struct socket* sock, void __user* arg);
+int do_get_proc_maps(struct socket* sock, void __user* arg);
 
 typedef int (*ioctl_handler_t)(struct socket* sock, void __user* arg);
 
@@ -291,6 +304,7 @@ static const struct ioctl_cmd_map {
     {.cmd = WUWA_IOCTL_GET_PROC_INFO, .handler = do_get_process_info},
     {.cmd = WUWA_IOCTL_READV_MEMORY, .handler = do_readv_memory},
     {.cmd = WUWA_IOCTL_WRITEV_MEMORY, .handler = do_writev_memory},
+    {.cmd = WUWA_IOCTL_GET_PROC_MAPS, .handler = do_get_proc_maps},
     {.cmd = 0, .handler = NULL} /* Sentinel to mark end of array */
 };
 

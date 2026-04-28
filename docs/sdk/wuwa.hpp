@@ -62,6 +62,7 @@ struct WuwaWritePhysicalMemoryIoremapCmd;
 struct WuwaBindProcCmd;
 struct WuwaListProcessesCmd;
 struct WuwaGetProcInfoCmd;
+struct WuwaGetProcMapsCmd;
 struct WuwaMemoryIovCmd;
 
 // IOCTL command definitions (magic number 'W')
@@ -88,6 +89,7 @@ struct WuwaMemoryIovCmd;
 #define WUWA_IOCTL_GET_PROC_INFO _IOWR('W', 20, WuwaGetProcInfoCmd)
 #define WUWA_IOCTL_READV_MEMORY _IOWR('W', 21, WuwaMemoryIovCmd)
 #define WUWA_IOCTL_WRITEV_MEMORY _IOWR('W', 22, WuwaMemoryIovCmd)
+#define WUWA_IOCTL_GET_PROC_MAPS _IOWR('W', 23, WuwaGetProcMapsCmd)
 
 // Command structures matching kernel definitions
 
@@ -241,6 +243,16 @@ struct WuwaGetProcInfoCmd {
     uid_t uid;
     pid_t ppid;
     int prio;
+};
+
+struct WuwaGetProcMapsCmd {
+    pid_t pid;
+    char* buf;
+    size_t buf_size;
+    size_t bytes_written;
+    uintptr_t start_addr;
+    uintptr_t next_addr;
+    int eof;
 };
 
 enum WuwaMemoryIovMode {
@@ -980,6 +992,42 @@ public:
         }
 
         return cmd;
+    }
+
+    /**
+     * Get /proc/<pid>/maps-compatible text without reading procfs
+     *
+     * The kernel returns whole VMA records per ioctl call; this helper loops
+     * until EOF and concatenates the chunks into a single maps string.
+     */
+    std::optional<std::string> get_proc_maps(pid_t pid, size_t chunk_size = 256 * 1024) {
+        constexpr size_t MIN_CHUNK_SIZE = 16 * 1024;
+        if (chunk_size < MIN_CHUNK_SIZE) {
+            chunk_size = MIN_CHUNK_SIZE;
+        }
+
+        std::vector<char> buffer(chunk_size);
+        std::string maps;
+        uintptr_t cursor = 0;
+
+        while (true) {
+            WuwaGetProcMapsCmd cmd = {pid, buffer.data(), buffer.size(), 0, cursor, cursor, 0};
+            if (!do_ioctl(WUWA_IOCTL_GET_PROC_MAPS, &cmd)) {
+                return std::nullopt;
+            }
+            if (cmd.bytes_written > buffer.size()) {
+                return std::nullopt;
+            }
+
+            maps.append(buffer.data(), cmd.bytes_written);
+            if (cmd.eof) {
+                return maps;
+            }
+            if (cmd.next_addr == cursor && cmd.bytes_written == 0) {
+                return std::nullopt;
+            }
+            cursor = cmd.next_addr;
+        }
     }
 
     /**
