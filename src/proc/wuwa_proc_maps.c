@@ -40,12 +40,6 @@
 #define __VM_NO_COMPAT 0
 #endif
 
-#ifdef CONFIG_CFI_CLANG
-#define WUWA_NO_CFI __nocfi
-#else
-#define WUWA_NO_CFI
-#endif
-
 #define WUWA_PROC_MAPS_MIN_CHUNK (16 * 1024)
 #define WUWA_PROC_MAPS_MAX_CHUNK (1024 * 1024)
 
@@ -55,25 +49,11 @@
 #define WUWA_HAS_VMA_ITERATOR 0
 #endif
 
-typedef unsigned long (*wuwa_vma_pages_fn_t)(struct vm_area_struct* vma);
-#if WUWA_HAS_VMA_ITERATOR
-typedef void (*wuwa_fold_fixup_fn_t)(struct vma_iterator* iter, unsigned long* end);
-#endif
-typedef void (*wuwa_show_pad_vma_fn_t)(struct vm_area_struct* vma, struct seq_file* m, void* func, bool smaps);
-
 struct wuwa_maps_ctx {
 #if WUWA_HAS_VMA_ITERATOR
     struct vma_iterator* iter;
 #endif
 };
-
-static wuwa_vma_pages_fn_t vma_data_pages_fn;
-static wuwa_vma_pages_fn_t vma_pad_pages_fn;
-#if WUWA_HAS_VMA_ITERATOR
-static wuwa_fold_fixup_fn_t fold_fixup_fn;
-#endif
-static wuwa_show_pad_vma_fn_t show_pad_vma_fn;
-static bool maps_symbols_resolved;
 
 static const char* wuwa_pad_vma_name(struct vm_area_struct* vma) {
     (void)vma;
@@ -84,43 +64,8 @@ static const struct vm_operations_struct wuwa_pad_vma_ops = {
     .name = wuwa_pad_vma_name,
 };
 
-static void wuwa_resolve_maps_symbols(void) {
-    if (maps_symbols_resolved)
-        return;
-
-    vma_data_pages_fn = (wuwa_vma_pages_fn_t)kallsyms_lookup_name_ex("vma_data_pages");
-    vma_pad_pages_fn = (wuwa_vma_pages_fn_t)kallsyms_lookup_name_ex("vma_pad_pages");
-#if WUWA_HAS_VMA_ITERATOR
-    fold_fixup_fn = (wuwa_fold_fixup_fn_t)kallsyms_lookup_name_ex("__fold_filemap_fixup_entry");
-#endif
-    show_pad_vma_fn = (wuwa_show_pad_vma_fn_t)kallsyms_lookup_name_ex("show_map_pad_vma");
-    maps_symbols_resolved = true;
-}
-
-static unsigned long WUWA_NO_CFI wuwa_call_vma_pages(wuwa_vma_pages_fn_t fn, struct vm_area_struct* vma) {
-    return fn(vma);
-}
-
-#if WUWA_HAS_VMA_ITERATOR
-static void WUWA_NO_CFI wuwa_call_fold_fixup(wuwa_fold_fixup_fn_t fn,
-                                             struct vma_iterator* iter,
-                                             unsigned long* end) {
-    fn(iter, end);
-}
-#endif
-
-static void WUWA_NO_CFI wuwa_call_show_pad_vma(wuwa_show_pad_vma_fn_t fn,
-                                               struct vm_area_struct* vma,
-                                               struct seq_file* m,
-                                               void* show_fn) {
-    fn(vma, m, show_fn, false);
-}
-
 static unsigned long wuwa_vma_pad_pages(struct vm_area_struct* vma) {
     unsigned long pad_pages;
-
-    if (vma_pad_pages_fn)
-        return wuwa_call_vma_pages(vma_pad_pages_fn, vma);
 
 #if VM_PAD_MASK != 0
     pad_pages = (vma->vm_flags & VM_PAD_MASK) >> VM_PAD_SHIFT;
@@ -136,9 +81,6 @@ static unsigned long wuwa_vma_pad_pages(struct vm_area_struct* vma) {
 static unsigned long wuwa_vma_data_pages(struct vm_area_struct* vma) {
     unsigned long pad_pages;
     unsigned long pages;
-
-    if (vma_data_pages_fn)
-        return wuwa_call_vma_pages(vma_data_pages_fn, vma);
 
     pages = vma_pages(vma);
     pad_pages = wuwa_vma_pad_pages(vma);
@@ -161,10 +103,6 @@ static void wuwa_fold_filemap_fixup_entry(struct vma_iterator* iter, unsigned lo
 
     if (!iter)
         return;
-    if (fold_fixup_fn) {
-        wuwa_call_fold_fixup(fold_fixup_fn, iter, end);
-        return;
-    }
     if (!__VM_NO_COMPAT)
         return;
 
@@ -196,6 +134,21 @@ static void wuwa_show_vma_header_prefix(struct seq_file* m,
                MAJOR(dev),
                MINOR(dev),
                ino);
+}
+
+static void wuwa_seq_pad(struct seq_file* m, char c) {
+    int size = m->pad_until - m->count;
+
+    if (size > 0) {
+        if (size + m->count > m->size) {
+            m->count = m->size;
+            return;
+        }
+        memset(m->buf + m->count, ' ', size);
+        m->count += size;
+    }
+    if (c)
+        seq_putc(m, c);
 }
 
 static bool wuwa_vma_anon_name_is_user_ptr(void) {
@@ -312,7 +265,7 @@ static void wuwa_show_map_vma(struct seq_file* m, struct vm_area_struct* vma) {
         anon_name = wuwa_vma_anon_name_kernel(vma);
 
     if (file) {
-        seq_pad(m, ' ');
+        wuwa_seq_pad(m, ' ');
         if (anon_name)
             seq_printf(m, "[anon_shmem:%s]", anon_name);
         else
@@ -333,17 +286,17 @@ static void wuwa_show_map_vma(struct seq_file* m, struct vm_area_struct* vma) {
         else if (vma_is_initial_stack(vma))
             name = "[stack]";
         else if (anon_name) {
-            seq_pad(m, ' ');
+            wuwa_seq_pad(m, ' ');
             seq_printf(m, "[anon:%s]", anon_name);
         } else if (wuwa_vma_anon_name_is_user_ptr() && wuwa_vma_anon_name_raw(vma)) {
-            seq_pad(m, ' ');
+            wuwa_seq_pad(m, ' ');
             wuwa_seq_print_user_anon_name(m, vma);
         }
     }
 
 done:
     if (name) {
-        seq_pad(m, ' ');
+        wuwa_seq_pad(m, ' ');
         seq_puts(m, name);
     }
     seq_putc(m, '\n');
@@ -364,10 +317,6 @@ static void wuwa_show_local_pad_vma(struct vm_area_struct* vma, struct seq_file*
 }
 
 static void wuwa_show_pad_vma(struct vm_area_struct* vma, struct seq_file* m) {
-    if (show_pad_vma_fn) {
-        wuwa_call_show_pad_vma(show_pad_vma_fn, vma, m, (void*)wuwa_show_map_vma);
-        return;
-    }
     wuwa_show_local_pad_vma(vma, m);
 }
 
@@ -441,7 +390,6 @@ static int wuwa_get_proc_maps(struct wuwa_get_proc_maps_cmd* cmd, char* kbuf, si
     if (!mm)
         return -ESRCH;
 
-    wuwa_resolve_maps_symbols();
     wuwa_seq_file_init(&seq, kbuf, kbuf_size, &ctx);
     MM_READ_LOCK(mm);
     ret = wuwa_emit_proc_maps(mm, cmd, &seq, &ctx);
